@@ -152,6 +152,56 @@ def render_summary_cards(health_data: list[dict]):
         """, unsafe_allow_html=True)
 
 
+METRIC_DISPLAY_NAMES = {
+    "CPUUtilization": "CPU Usage",
+    "FreeableMemory": "Low Memory",
+    "ReadLatency": "Read Latency",
+    "WriteLatency": "Write Latency",
+    "DiskQueueDepth": "Disk Queue",
+    "DatabaseConnections": "Connections",
+}
+
+METRIC_ALERT_MESSAGES = {
+    "CPUUtilization": "CPU usage is high",
+    "FreeableMemory": "Available memory is critically low",
+    "ReadLatency": "Read latency is elevated",
+    "WriteLatency": "Write latency is elevated",
+    "DiskQueueDepth": "Disk I/O queue depth is high",
+    "DatabaseConnections": "Connection count is near limit",
+}
+
+
+def get_triggered_alerts(health: dict) -> list[dict]:
+    """Get list of metrics that triggered warning/critical status.
+
+    Args:
+        health: Health data dict for the instance
+
+    Returns:
+        List of dicts with metric name, status, value, and message
+    """
+    alerts = []
+    metrics = health.get("metrics", {})
+    max_conn = health.get("max_connections")
+
+    for metric_name, value in metrics.items():
+        status = calculate_metric_status(
+            metric_name,
+            value,
+            max_connections=max_conn,
+        )
+        if status in (HealthStatus.WARNING, HealthStatus.CRITICAL):
+            alerts.append({
+                "metric": metric_name,
+                "display_name": METRIC_DISPLAY_NAMES.get(metric_name, metric_name),
+                "status": status,
+                "value": format_metric_value(metric_name, value),
+                "message": METRIC_ALERT_MESSAGES.get(metric_name, "Threshold exceeded"),
+            })
+
+    return alerts
+
+
 def render_health_card(health: dict, index: int):
     """Render a single health card for an RDS instance.
 
@@ -169,6 +219,23 @@ def render_health_card(health: dict, index: int):
     memory = format_metric_value("FreeableMemory", metrics.get("FreeableMemory"))
     connections = format_metric_value("DatabaseConnections", metrics.get("DatabaseConnections"))
 
+    # Get triggered alerts
+    alerts = get_triggered_alerts(health)
+
+    # Build alert HTML if any
+    alert_html = ""
+    if alerts:
+        alert_items = ""
+        for alert in alerts:
+            alert_color = get_status_color(alert["status"])
+            alert_items += f"""
+            <div class="health-alert-item" style="border-left: 2px solid {alert_color};">
+                <span class="health-alert-icon" style="color: {alert_color};">{get_status_icon(alert["status"])}</span>
+                <span class="health-alert-text">{alert["message"]} ({alert["value"]})</span>
+            </div>
+            """
+        alert_html = f'<div class="health-alerts">{alert_items}</div>'
+
     # Shorten region for display
     region_short = health["region"].replace("southeast", "se").replace("northeast", "ne").replace("east", "e").replace("west", "w")
 
@@ -184,6 +251,7 @@ def render_health_card(health: dict, index: int):
         <div class="health-status-badge" style="background: {status_dim}; color: {status_color};">
             {status.value.upper()}
         </div>
+        {alert_html}
         <div class="health-metrics-row">
             <div class="health-metric">
                 <div class="health-metric-label">CPU</div>

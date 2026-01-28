@@ -457,7 +457,31 @@ st.markdown("""
         font-size: 0.7rem;
         font-weight: 600;
         letter-spacing: 0.05em;
+        margin-bottom: 0.75rem;
+    }
+
+    .health-alerts {
         margin-bottom: 1rem;
+    }
+
+    .health-alert-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        background: rgba(255, 71, 87, 0.08);
+        border-radius: 6px;
+        margin-bottom: 4px;
+    }
+
+    .health-alert-icon {
+        font-size: 0.8rem;
+    }
+
+    .health-alert-text {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.7rem;
+        color: var(--text-secondary);
     }
 
     .health-metrics-row {
