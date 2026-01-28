@@ -160,7 +160,7 @@ exec > /var/log/user-data.log 2>&1
 
 # Update system
 dnf update -y
-dnf install -y python3.11 python3.11-pip git
+dnf install -y python3.11 python3.11-pip git nginx
 
 # Clone repository
 cd /opt
@@ -174,7 +174,7 @@ source venv/bin/activate
 # Install dependencies
 pip install streamlit boto3 pandas plotly
 
-# Create systemd service
+# Create streamlit service
 cat > /etc/systemd/system/aws-monitor.service << 'SVCFILE'
 [Unit]
 Description=AWS Monitor Streamlit App
@@ -184,7 +184,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/aws-monitor
-ExecStart=/opt/aws-monitor/venv/bin/streamlit run app_v2.py --server.address 0.0.0.0 --server.port 8501
+ExecStart=/opt/aws-monitor/venv/bin/streamlit run app_v2.py --server.address 127.0.0.1 --server.port 8501
 Restart=always
 RestartSec=5
 
@@ -192,10 +192,43 @@ RestartSec=5
 WantedBy=multi-user.target
 SVCFILE
 
-# Start the service
+# Configure nginx as reverse proxy
+cat > /etc/nginx/conf.d/aws-monitor.conf << 'NGINXCONF'
+server {{
+    listen 80;
+    server_name _;
+
+    location / {{
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 86400;
+    }}
+
+    location /_stcore/stream {{
+        proxy_pass http://127.0.0.1:8501/_stcore/stream;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400;
+    }}
+}}
+NGINXCONF
+
+# Remove default nginx config
+rm -f /etc/nginx/conf.d/default.conf
+
+# Start services
 systemctl daemon-reload
-systemctl enable aws-monitor
+systemctl enable aws-monitor nginx
 systemctl start aws-monitor
+systemctl start nginx
 
 echo "Deployment complete!"
 """
