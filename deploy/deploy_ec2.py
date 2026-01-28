@@ -158,7 +158,7 @@ def create_iam_role(iam_client):
 def generate_user_data():
     """Generate the user data script with embedded application code."""
 
-    app_code = read_file(os.path.join(app_dir, 'app.py'))
+    app_code = read_file(os.path.join(app_dir, 'app_v2.py'))
 
     # Read all source files
     src_files = {}
