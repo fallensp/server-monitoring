@@ -32,13 +32,6 @@ pip install streamlit boto3 pandas plotly
 cat > app.py << 'APPEOF'
 """
 
-# Read the app files
-import os
-app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-def read_file(path):
-    with open(path, 'r') as f:
-        return f.read()
 
 def get_latest_ami(ec2_client):
     """Get latest Amazon Linux 2023 AMI."""
@@ -155,33 +148,23 @@ def create_iam_role(iam_client):
     return instance_profile_name
 
 
+GITHUB_REPO = "https://github.com/fallensp/server-monitoring.git"
+
+
 def generate_user_data():
-    """Generate the user data script with embedded application code."""
+    """Generate the user data script that clones from GitHub."""
 
-    app_code = read_file(os.path.join(app_dir, 'app_v2.py'))
-
-    # Read all source files
-    src_files = {}
-    for root, dirs, files in os.walk(os.path.join(app_dir, 'src')):
-        for file in files:
-            if file.endswith('.py'):
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, app_dir)
-                src_files[rel_path] = read_file(full_path)
-
-    script = """#!/bin/bash
+    script = f"""#!/bin/bash
 set -ex
 exec > /var/log/user-data.log 2>&1
 
 # Update system
 dnf update -y
-dnf install -y python3.11 python3.11-pip
+dnf install -y python3.11 python3.11-pip git
 
-# Create app directory
-mkdir -p /opt/aws-monitor/src/aws
-mkdir -p /opt/aws-monitor/src/services
-mkdir -p /opt/aws-monitor/src/ui
-mkdir -p /opt/aws-monitor/.streamlit
+# Clone repository
+cd /opt
+git clone {GITHUB_REPO} aws-monitor
 cd /opt/aws-monitor
 
 # Create virtual environment
@@ -191,47 +174,6 @@ source venv/bin/activate
 # Install dependencies
 pip install streamlit boto3 pandas plotly
 
-# Create streamlit config
-cat > .streamlit/config.toml << 'STCONFIG'
-[theme]
-primaryColor = "#FF9900"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F5F5F5"
-textColor = "#232F3E"
-font = "sans serif"
-
-[server]
-headless = true
-address = "0.0.0.0"
-port = 8501
-STCONFIG
-
-"""
-
-    # Add app.py
-    script += f"""
-# Create app.py
-cat > app.py << 'APPFILE'
-{app_code}
-APPFILE
-
-"""
-
-    # Add all source files
-    for rel_path, content in src_files.items():
-        # Escape single quotes in content for heredoc
-        escaped_content = content.replace("'", "'\"'\"'")
-        script += f"""
-# Create {rel_path}
-mkdir -p $(dirname {rel_path})
-cat > {rel_path} << 'SRCFILE_{rel_path.replace('/', '_').replace('.', '_')}'
-{content}
-SRCFILE_{rel_path.replace('/', '_').replace('.', '_')}
-
-"""
-
-    # Add systemd service and start
-    script += """
 # Create systemd service
 cat > /etc/systemd/system/aws-monitor.service << 'SVCFILE'
 [Unit]
@@ -242,7 +184,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/aws-monitor
-ExecStart=/opt/aws-monitor/venv/bin/streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+ExecStart=/opt/aws-monitor/venv/bin/streamlit run app_v2.py --server.address 0.0.0.0 --server.port 8501
 Restart=always
 RestartSec=5
 
