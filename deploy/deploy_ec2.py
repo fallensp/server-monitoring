@@ -1,36 +1,14 @@
-"""Deploy AWS Monitor to EC2 spot instance."""
+"""Deploy AWS Monitor to EC2 with Auto Scaling Group for resilience."""
 
 import boto3
-import base64
 import time
 import sys
+import json
 
-REGION = "ap-southeast-1"  # Singapore (closest to Malaysia)
+REGION = "ap-southeast-1"
 INSTANCE_TYPE = "t3.small"
-AMI_ID = None  # Will be fetched dynamically (Amazon Linux 2023)
-
-# User data script to set up the application
-USER_DATA = """#!/bin/bash
-set -ex
-
-# Update system
-dnf update -y
-dnf install -y python3.11 python3.11-pip git
-
-# Create app directory
-mkdir -p /opt/aws-monitor
-cd /opt/aws-monitor
-
-# Create virtual environment
-python3.11 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install streamlit boto3 pandas plotly
-
-# Create the application files
-cat > app.py << 'APPEOF'
-"""
+GITHUB_REPO = "https://github.com/fallensp/server-monitoring.git"
+EIP_ALLOCATION_ID = "eipalloc-073453656b3e5755f"  # Fixed Elastic IP
 
 
 def get_latest_ami(ec2_client):
@@ -47,11 +25,23 @@ def get_latest_ami(ec2_client):
     return images[0]['ImageId'] if images else None
 
 
+def get_default_vpc_subnets(ec2_client):
+    """Get subnets from the default VPC."""
+    response = ec2_client.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+    if not response['Vpcs']:
+        print("ERROR: No default VPC found")
+        sys.exit(1)
+    vpc_id = response['Vpcs'][0]['VpcId']
+
+    response = ec2_client.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])
+    subnet_ids = [s['SubnetId'] for s in response['Subnets']]
+    return subnet_ids
+
+
 def create_security_group(ec2_client):
     """Create security group for the app."""
     sg_name = "aws-monitor-sg"
 
-    # Check if exists
     try:
         response = ec2_client.describe_security_groups(GroupNames=[sg_name])
         sg_id = response['SecurityGroups'][0]['GroupId']
@@ -60,29 +50,23 @@ def create_security_group(ec2_client):
     except ec2_client.exceptions.ClientError:
         pass
 
-    # Create new security group
     response = ec2_client.create_security_group(
         GroupName=sg_name,
         Description="Security group for AWS Monitor Streamlit app"
     )
     sg_id = response['GroupId']
 
-    # Add inbound rules
     ec2_client.authorize_security_group_ingress(
         GroupId=sg_id,
         IpPermissions=[
-            {
-                'IpProtocol': 'tcp',
-                'FromPort': 8501,
-                'ToPort': 8501,
-                'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'Streamlit'}]
-            },
-            {
-                'IpProtocol': 'tcp',
-                'FromPort': 22,
-                'ToPort': 22,
-                'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'SSH'}]
-            }
+            {'IpProtocol': 'tcp', 'FromPort': 80, 'ToPort': 80,
+             'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'HTTP'}]},
+            {'IpProtocol': 'tcp', 'FromPort': 443, 'ToPort': 443,
+             'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'HTTPS'}]},
+            {'IpProtocol': 'tcp', 'FromPort': 22, 'ToPort': 22,
+             'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'SSH'}]},
+            {'IpProtocol': 'tcp', 'FromPort': 8501, 'ToPort': 8501,
+             'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'Streamlit'}]},
         ]
     )
     print(f"Created security group: {sg_id}")
@@ -90,73 +74,93 @@ def create_security_group(ec2_client):
 
 
 def create_iam_role(iam_client):
-    """Create IAM role for EC2 instance."""
+    """Create IAM role for EC2 instance with EIP association permission."""
     role_name = "aws-monitor-ec2-role"
     instance_profile_name = "aws-monitor-instance-profile"
 
-    # Check if role exists
     try:
         iam_client.get_role(RoleName=role_name)
         print(f"Using existing IAM role: {role_name}")
     except iam_client.exceptions.NoSuchEntityException:
-        # Create role
-        assume_role_policy = '''{
+        assume_role_policy = json.dumps({
             "Version": "2012-10-17",
             "Statement": [{
                 "Effect": "Allow",
                 "Principal": {"Service": "ec2.amazonaws.com"},
                 "Action": "sts:AssumeRole"
             }]
-        }'''
+        })
 
         iam_client.create_role(
             RoleName=role_name,
             AssumeRolePolicyDocument=assume_role_policy,
             Description="Role for AWS Monitor EC2 instance"
         )
-
-        # Attach policies for read-only access
-        policies = [
-            "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
-            "arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess",
-            "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess",
-            "arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess",
-        ]
-        for policy in policies:
-            try:
-                iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy)
-            except Exception as e:
-                print(f"Warning: Could not attach {policy}: {e}")
-
         print(f"Created IAM role: {role_name}")
 
-    # Check if instance profile exists
+    # Attach required policies
+    policies = [
+        "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",
+        "arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess",
+        "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess",
+        "arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess",
+        "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    ]
+    for policy in policies:
+        try:
+            iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy)
+        except Exception:
+            pass
+
+    # Add inline policy for EIP association
+    eip_policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+                "ec2:AssociateAddress",
+                "ec2:DescribeAddresses"
+            ],
+            "Resource": "*"
+        }]
+    })
+    try:
+        iam_client.put_role_policy(
+            RoleName=role_name,
+            PolicyName="eip-association",
+            PolicyDocument=eip_policy
+        )
+    except Exception:
+        pass
+
     try:
         iam_client.get_instance_profile(InstanceProfileName=instance_profile_name)
         print(f"Using existing instance profile: {instance_profile_name}")
     except iam_client.exceptions.NoSuchEntityException:
-        # Create instance profile
         iam_client.create_instance_profile(InstanceProfileName=instance_profile_name)
         iam_client.add_role_to_instance_profile(
             InstanceProfileName=instance_profile_name,
             RoleName=role_name
         )
         print(f"Created instance profile: {instance_profile_name}")
-        # Wait for it to be available
         time.sleep(10)
 
     return instance_profile_name
 
 
-GITHUB_REPO = "https://github.com/fallensp/server-monitoring.git"
-
-
 def generate_user_data():
-    """Generate the user data script that clones from GitHub."""
-
+    """Generate the user data script with EIP auto-association."""
     script = f"""#!/bin/bash
 set -ex
 exec > /var/log/user-data.log 2>&1
+
+# Get instance metadata
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+
+# Associate Elastic IP
+aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id {EIP_ALLOCATION_ID} --region $REGION --allow-reassociation || echo "EIP association failed, continuing..."
 
 # Update system
 dnf update -y
@@ -164,6 +168,7 @@ dnf install -y python3.11 python3.11-pip git nginx
 
 # Clone repository
 cd /opt
+rm -rf aws-monitor
 git clone {GITHUB_REPO} aws-monitor
 cd /opt/aws-monitor
 
@@ -221,7 +226,6 @@ server {{
 }}
 NGINXCONF
 
-# Remove default nginx config
 rm -f /etc/nginx/conf.d/default.conf
 
 # Start services
@@ -232,66 +236,158 @@ systemctl start nginx
 
 echo "Deployment complete!"
 """
-
     return script
 
 
-def launch_spot_instance(ec2_client, sg_id, instance_profile, ami_id):
-    """Launch a spot instance."""
-
+def create_launch_template(ec2_client, sg_id, instance_profile, ami_id):
+    """Create or update launch template."""
+    template_name = "aws-monitor-template"
     user_data = generate_user_data()
 
-    response = ec2_client.run_instances(
-        ImageId=ami_id,
-        InstanceType=INSTANCE_TYPE,
-        MinCount=1,
-        MaxCount=1,
-        SecurityGroupIds=[sg_id],
-        IamInstanceProfile={'Name': instance_profile},
-        UserData=user_data,
-        InstanceMarketOptions={
-            'MarketType': 'spot',
-            'SpotOptions': {
-                'SpotInstanceType': 'one-time',
-                'InstanceInterruptionBehavior': 'terminate'
-            }
-        },
-        TagSpecifications=[{
+    import base64
+    user_data_b64 = base64.b64encode(user_data.encode()).decode()
+
+    launch_template_data = {
+        'ImageId': ami_id,
+        'InstanceType': INSTANCE_TYPE,
+        'SecurityGroupIds': [sg_id],
+        'IamInstanceProfile': {'Name': instance_profile},
+        'UserData': user_data_b64,
+        'TagSpecifications': [{
             'ResourceType': 'instance',
             'Tags': [
                 {'Key': 'Name', 'Value': 'aws-monitor'},
                 {'Key': 'Project', 'Value': 'aws-monitor'}
             ]
-        }]
-    )
+        }],
+    }
 
-    instance_id = response['Instances'][0]['InstanceId']
-    print(f"Launched spot instance: {instance_id}")
-    return instance_id
+    try:
+        # Try to create new version of existing template
+        response = ec2_client.create_launch_template_version(
+            LaunchTemplateName=template_name,
+            LaunchTemplateData=launch_template_data,
+            SourceVersion='$Latest'
+        )
+        version = response['LaunchTemplateVersion']['VersionNumber']
+
+        # Set as default version
+        ec2_client.modify_launch_template(
+            LaunchTemplateName=template_name,
+            DefaultVersion=str(version)
+        )
+        print(f"Updated launch template: {template_name} (version {version})")
+
+    except ec2_client.exceptions.ClientError as e:
+        if 'InvalidLaunchTemplateName.NotFoundException' in str(e):
+            response = ec2_client.create_launch_template(
+                LaunchTemplateName=template_name,
+                LaunchTemplateData=launch_template_data
+            )
+            print(f"Created launch template: {template_name}")
+        else:
+            raise
+
+    return template_name
 
 
-def wait_for_instance(ec2_client, instance_id):
-    """Wait for instance to be running and get public IP."""
+def create_auto_scaling_group(asg_client, template_name, subnet_ids):
+    """Create or update Auto Scaling Group with spot instances."""
+    asg_name = "aws-monitor-asg"
+
+    # Check if ASG exists
+    response = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+
+    mixed_instances_policy = {
+        'LaunchTemplate': {
+            'LaunchTemplateSpecification': {
+                'LaunchTemplateName': template_name,
+                'Version': '$Latest'
+            },
+        },
+        'InstancesDistribution': {
+            'OnDemandBaseCapacity': 0,
+            'OnDemandPercentageAboveBaseCapacity': 0,  # 100% spot
+            'SpotAllocationStrategy': 'price-capacity-optimized',
+        }
+    }
+
+    if response['AutoScalingGroups']:
+        # Update existing ASG
+        asg_client.update_auto_scaling_group(
+            AutoScalingGroupName=asg_name,
+            MixedInstancesPolicy=mixed_instances_policy,
+            MinSize=1,
+            MaxSize=1,
+            DesiredCapacity=1,
+            VPCZoneIdentifier=','.join(subnet_ids),
+        )
+        print(f"Updated Auto Scaling Group: {asg_name}")
+
+        # Force instance refresh to apply new launch template
+        try:
+            asg_client.start_instance_refresh(
+                AutoScalingGroupName=asg_name,
+                Strategy='Rolling',
+                Preferences={
+                    'MinHealthyPercentage': 0,
+                    'InstanceWarmup': 120
+                }
+            )
+            print("Started instance refresh...")
+        except Exception as e:
+            if 'InstanceRefreshInProgress' not in str(e):
+                print(f"Note: {e}")
+    else:
+        # Create new ASG
+        asg_client.create_auto_scaling_group(
+            AutoScalingGroupName=asg_name,
+            MixedInstancesPolicy=mixed_instances_policy,
+            MinSize=1,
+            MaxSize=1,
+            DesiredCapacity=1,
+            VPCZoneIdentifier=','.join(subnet_ids),
+            Tags=[
+                {'Key': 'Name', 'Value': 'aws-monitor', 'PropagateAtLaunch': True},
+                {'Key': 'Project', 'Value': 'aws-monitor', 'PropagateAtLaunch': True},
+            ],
+            HealthCheckType='EC2',
+            HealthCheckGracePeriod=300,
+        )
+        print(f"Created Auto Scaling Group: {asg_name}")
+
+    return asg_name
+
+
+def wait_for_instance(asg_client, ec2_client, asg_name):
+    """Wait for ASG instance to be running."""
     print("Waiting for instance to start...")
 
-    waiter = ec2_client.get_waiter('instance_running')
-    waiter.wait(InstanceIds=[instance_id])
+    for _ in range(30):  # Wait up to 5 minutes
+        response = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+        instances = response['AutoScalingGroups'][0].get('Instances', [])
 
-    response = ec2_client.describe_instances(InstanceIds=[instance_id])
-    instance = response['Reservations'][0]['Instances'][0]
-    public_ip = instance.get('PublicIpAddress')
+        for inst in instances:
+            if inst['LifecycleState'] == 'InService':
+                instance_id = inst['InstanceId']
 
-    print(f"Instance is running!")
-    print(f"Public IP: {public_ip}")
+                # Get public IP
+                ec2_response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                public_ip = ec2_response['Reservations'][0]['Instances'][0].get('PublicIpAddress')
 
-    return public_ip
+                return instance_id, public_ip
+
+        time.sleep(10)
+
+    return None, None
 
 
 def main():
-    print(f"Deploying AWS Monitor to {REGION}...")
+    print(f"Deploying AWS Monitor to {REGION} with Auto Scaling...")
 
     ec2 = boto3.client('ec2', region_name=REGION)
     iam = boto3.client('iam', region_name=REGION)
+    asg = boto3.client('autoscaling', region_name=REGION)
 
     # Get AMI
     ami_id = get_latest_ami(ec2)
@@ -300,28 +396,37 @@ def main():
         sys.exit(1)
     print(f"Using AMI: {ami_id}")
 
+    # Get subnets
+    subnet_ids = get_default_vpc_subnets(ec2)
+    print(f"Using subnets: {subnet_ids}")
+
     # Create security group
     sg_id = create_security_group(ec2)
 
     # Create IAM role
     instance_profile = create_iam_role(iam)
 
-    # Launch instance
-    instance_id = launch_spot_instance(ec2, sg_id, instance_profile, ami_id)
+    # Create launch template
+    template_name = create_launch_template(ec2, sg_id, instance_profile, ami_id)
 
-    # Wait and get IP
-    public_ip = wait_for_instance(ec2, instance_id)
+    # Create/update ASG
+    asg_name = create_auto_scaling_group(asg, template_name, subnet_ids)
+
+    # Wait for instance
+    instance_id, public_ip = wait_for_instance(asg, ec2, asg_name)
 
     print("\n" + "="*50)
     print("DEPLOYMENT COMPLETE!")
     print("="*50)
-    print(f"\nInstance ID: {instance_id}")
-    print(f"Public IP: {public_ip}")
+    print(f"\nAuto Scaling Group: {asg_name}")
+    print(f"Instance ID: {instance_id}")
+    print(f"Elastic IP: 54.151.150.4")
     print(f"\nThe app will be available at:")
-    print(f"  http://{public_ip}:8501")
+    print(f"  http://54.151.150.4")
+    print(f"  http://monitoring.thedaydreamer.ai")
     print(f"\nNote: It may take 2-3 minutes for the app to fully start.")
-    print("You can check the setup progress by SSHing into the instance and running:")
-    print("  tail -f /var/log/user-data.log")
+    print("\nThe ASG will automatically launch a new instance if the spot")
+    print("instance is terminated, and it will bind to the same Elastic IP.")
 
 
 if __name__ == "__main__":
