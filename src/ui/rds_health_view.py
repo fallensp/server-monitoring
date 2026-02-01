@@ -214,10 +214,10 @@ def render_health_card(health: dict, index: int):
     status_dim = get_status_dim_color(status)
     metrics = health.get("metrics", {})
 
-    # Format metric values
-    cpu = format_metric_value("CPUUtilization", metrics.get("CPUUtilization"))
-    memory = format_metric_value("FreeableMemory", metrics.get("FreeableMemory"))
-    connections = format_metric_value("DatabaseConnections", metrics.get("DatabaseConnections"))
+    # Format metric values - ensure they're strings
+    cpu = str(format_metric_value("CPUUtilization", metrics.get("CPUUtilization")))
+    memory = str(format_metric_value("FreeableMemory", metrics.get("FreeableMemory")))
+    connections = str(format_metric_value("DatabaseConnections", metrics.get("DatabaseConnections")))
 
     # Get triggered alerts
     alerts = get_triggered_alerts(health)
@@ -225,52 +225,29 @@ def render_health_card(health: dict, index: int):
     # Build alert HTML if any
     alert_html = ""
     if alerts:
-        alert_items = ""
+        alert_items = []
         for alert in alerts:
             alert_color = get_status_color(alert["status"])
-            alert_items += f"""
-            <div class="health-alert-item" style="border-left: 2px solid {alert_color};">
-                <span class="health-alert-icon" style="color: {alert_color};">{get_status_icon(alert["status"])}</span>
-                <span class="health-alert-text">{alert["message"]} ({alert["value"]})</span>
-            </div>
-            """
-        alert_html = f'<div class="health-alerts">{alert_items}</div>'
+            alert_items.append(
+                f'<div class="health-alert-item" style="border-left: 2px solid {alert_color};">'
+                f'<span class="health-alert-icon" style="color: {alert_color};">{get_status_icon(alert["status"])}</span>'
+                f'<span class="health-alert-text">{alert["message"]} ({alert["value"]})</span>'
+                f'</div>'
+            )
+        alert_html = f'<div class="health-alerts">{"".join(alert_items)}</div>'
 
     # Shorten region for display
     region_short = health["region"].replace("southeast", "se").replace("northeast", "ne").replace("east", "e").replace("west", "w")
+    engine = health.get("engine", "") or ""
+    db_id = health.get("db_id", "") or ""
 
-    st.markdown(f"""
-    <div class="health-card" style="border-left: 4px solid {status_color};">
-        <div class="health-card-header">
-            <div class="health-card-title">
-                <span class="health-card-icon" style="background: {status_dim}; color: {status_color};">&#9632;</span>
-                <span class="health-card-name">{health["db_id"]}</span>
-            </div>
-            <div class="health-card-meta">{health.get("engine", "")} | {region_short}</div>
-        </div>
-        <div class="health-status-badge" style="background: {status_dim}; color: {status_color};">
-            {status.value.upper()}
-        </div>
-        {alert_html}
-        <div class="health-metrics-row">
-            <div class="health-metric">
-                <div class="health-metric-label">CPU</div>
-                <div class="health-metric-value">{cpu}</div>
-            </div>
-            <div class="health-metric">
-                <div class="health-metric-label">Memory</div>
-                <div class="health-metric-value">{memory}</div>
-            </div>
-            <div class="health-metric">
-                <div class="health-metric-label">Conn</div>
-                <div class="health-metric-value">{connections}</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Build HTML as single string to avoid rendering issues
+    html = f'''<div class="health-card" style="border-left: 4px solid {status_color};"><div class="health-card-header"><div class="health-card-title"><span class="health-card-icon" style="background: {status_dim}; color: {status_color};">&#9632;</span><span class="health-card-name">{db_id}</span></div><div class="health-card-meta">{engine} | {region_short}</div></div><div class="health-status-badge" style="background: {status_dim}; color: {status_color};">{status.value.upper()}</div>{alert_html}<div class="health-metrics-row"><div class="health-metric"><div class="health-metric-label">CPU</div><div class="health-metric-value">{cpu}</div></div><div class="health-metric"><div class="health-metric-label">Memory</div><div class="health-metric-value">{memory}</div></div><div class="health-metric"><div class="health-metric-label">Conn</div><div class="health-metric-value">{connections}</div></div></div></div>'''
+
+    st.markdown(html, unsafe_allow_html=True)
 
     # Expandable details with charts
-    with st.expander(f"View Details - {health['db_id']}", expanded=False):
+    with st.expander(f"View Details - {db_id}", expanded=False):
         render_health_charts(health["db_id"], health["region"])
 
 
