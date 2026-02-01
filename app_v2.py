@@ -590,7 +590,7 @@ def get_ec2_data(regions_key):
 def get_rds_data(regions_key):
     return fetch_all_parallel(fetch_rds_for_region, list(regions_key))
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def get_billing_data():
     """Fetch billing data from Cost Explorer."""
     try:
@@ -973,7 +973,13 @@ if billing["available"]:
             </div>
             """, unsafe_allow_html=True)
 else:
-    st.info("💡 Billing data requires Cost Explorer API access. Enable it in your AWS account to see cost metrics.")
+    error_msg = billing.get("error", "Unknown error")
+    if "AccessDenied" in error_msg or "not authorized" in error_msg.lower():
+        st.warning(f"⚠️ IAM permission error: The EC2 instance role needs `ce:GetCostAndUsage` permission. Error: {error_msg}")
+    elif error_msg:
+        st.info(f"💡 Billing data unavailable: {error_msg}")
+    else:
+        st.info("💡 Billing data requires Cost Explorer API access. Enable it in your AWS account to see cost metrics.")
 
 # EC2 Section
 st.markdown(f"""
