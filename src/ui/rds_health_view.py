@@ -324,7 +324,7 @@ def render_health_charts(db_id: str, region: str):
                 ),
             )
 
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=f"chart_{db_id}_{metric_name}")
 
 
 def render_rds_health_section(rds_data: list[dict]):
