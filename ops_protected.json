@@ -1,0 +1,7 @@
+{
+  "i-048793c2fa0a5d46f": "sms-gateway-api — production API, do not stop from dashboard",
+  "sms-gateway-api": "production API, do not stop from dashboard",
+  "i-008e95030cd6abee4": "bubble-game-api — production API, do not stop from dashboard",
+  "bubble-game-api": "production API, do not stop from dashboard",
+  "sg-postgres": "production database, do not stop from dashboard"
+}

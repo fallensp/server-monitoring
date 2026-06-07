@@ -24,6 +24,32 @@ METRIC_THRESHOLDS = {
     "DatabaseConnections": (0.80, 0.95, True),  # >80% of max warning, >95% critical (as ratio)
 }
 
+# Total memory by instance class, in bytes (for FreeableMemory ratio)
+_GB = 1024 * 1024 * 1024
+DEFAULT_MEMORY_BYTES = {
+    "db.t2.micro": 1 * _GB,
+    "db.t2.small": 2 * _GB,
+    "db.t2.medium": 4 * _GB,
+    "db.t2.large": 8 * _GB,
+    "db.t3.micro": 1 * _GB,
+    "db.t3.small": 2 * _GB,
+    "db.t3.medium": 4 * _GB,
+    "db.t3.large": 8 * _GB,
+    "db.t3.xlarge": 16 * _GB,
+    "db.t3.2xlarge": 32 * _GB,
+    "db.t4g.micro": 1 * _GB,
+    "db.t4g.small": 2 * _GB,
+    "db.t4g.medium": 4 * _GB,
+    "db.t4g.large": 8 * _GB,
+    "db.m5.large": 8 * _GB,
+    "db.m5.xlarge": 16 * _GB,
+    "db.m5.2xlarge": 32 * _GB,
+    "db.m5.4xlarge": 64 * _GB,
+    "db.r5.large": 16 * _GB,
+    "db.r5.xlarge": 32 * _GB,
+    "db.r5.2xlarge": 64 * _GB,
+}
+
 # Default max connections by instance class (approximate)
 DEFAULT_MAX_CONNECTIONS = {
     "db.t2.micro": 66,
@@ -74,8 +100,8 @@ def calculate_metric_status(
     # Handle special cases that need conversion
     if metric_name == "FreeableMemory":
         if total_memory_bytes is None or total_memory_bytes <= 0:
-            # Estimate based on typical instance sizes (2GB as fallback)
-            total_memory_bytes = 2 * 1024 * 1024 * 1024
+            # Can't evaluate the free-memory ratio without knowing total RAM
+            return HealthStatus.UNKNOWN
         ratio = value / total_memory_bytes
         # For memory, we check if the FREE ratio is below threshold
         if ratio < critical_threshold:
@@ -86,8 +112,8 @@ def calculate_metric_status(
 
     if metric_name == "DatabaseConnections":
         if max_connections is None or max_connections <= 0:
-            # Can't evaluate without knowing max
-            return HealthStatus.HEALTHY
+            # Can't evaluate without knowing max — don't claim healthy
+            return HealthStatus.UNKNOWN
         ratio = value / max_connections
         # Check connection usage ratio
         if ratio >= critical_threshold:
@@ -246,3 +272,15 @@ def get_max_connections_for_class(instance_class: str) -> int | None:
         Max connections or None if unknown
     """
     return DEFAULT_MAX_CONNECTIONS.get(instance_class)
+
+
+def get_memory_for_class(instance_class: str) -> int | None:
+    """Get the total memory in bytes for an RDS instance class.
+
+    Args:
+        instance_class: RDS instance class (e.g., 'db.t3.micro')
+
+    Returns:
+        Total memory in bytes or None if unknown
+    """
+    return DEFAULT_MEMORY_BYTES.get(instance_class)

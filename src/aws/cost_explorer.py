@@ -3,7 +3,7 @@
 Note: Cost Explorer API only works in us-east-1 and costs $0.01 per API call.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from src.aws.client import get_client
 
 
@@ -18,7 +18,7 @@ def get_monthly_costs(months: int = 6) -> list[dict]:
     """
     ce = get_client("ce", "us-east-1")
 
-    end_date = datetime.utcnow().replace(day=1)
+    end_date = datetime.now(timezone.utc).replace(day=1)
     start_date = (end_date - timedelta(days=months * 31)).replace(day=1)
 
     try:
@@ -56,7 +56,7 @@ def get_daily_costs(days: int = 30) -> list[dict]:
     """
     ce = get_client("ce", "us-east-1")
 
-    end_date = datetime.utcnow().date()
+    end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=days)
 
     try:
@@ -94,7 +94,7 @@ def get_cost_by_service(days: int = 30) -> list[dict]:
     """
     ce = get_client("ce", "us-east-1")
 
-    end_date = datetime.utcnow().date()
+    end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=days)
 
     try:
@@ -137,7 +137,7 @@ def get_cost_forecast(days: int = 30) -> dict | None:
     """
     ce = get_client("ce", "us-east-1")
 
-    start_date = datetime.utcnow().date() + timedelta(days=1)
+    start_date = datetime.now(timezone.utc).date() + timedelta(days=1)
     end_date = start_date + timedelta(days=days)
 
     try:
@@ -167,7 +167,7 @@ def get_mtd_cost() -> float:
     """
     ce = get_client("ce", "us-east-1")
 
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     start_date = today.replace(day=1)
 
     try:

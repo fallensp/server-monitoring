@@ -3,14 +3,22 @@ AWS Resource Monitoring Portal v2
 A beautifully designed dashboard for monitoring AWS resources with billing metrics.
 """
 
+import calendar
+import html
+
 import streamlit as st
 import boto3
 import pandas as pd
 import plotly.graph_objects as go
+from botocore.exceptions import BotoCoreError, ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.ui.rds_health_view import render_rds_health_section, get_health_css
+from src.ui import auth
+from src.ui import control_view
+from src.services.billing_centers import classify_resource, get_center_label
+from src.services.rds_watchdog import get_restart_countdowns, format_remaining
 
 # Page config - must be first
 st.set_page_config(
@@ -511,11 +519,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Region configurations
+# Login gate — nothing below runs (or is fetched) until authenticated
+auth.require_login()
+
+# Region configurations — the actual infrastructure footprint (all four
+# billing centers): Singapore, Jakarta, Tokyo, Hong Kong + us-east-1 (global)
 COMMON_REGIONS = [
     "ap-southeast-1", "ap-southeast-3", "ap-northeast-1",
-    "ap-northeast-2", "ap-south-1", "us-east-1",
-    "us-west-2", "eu-west-1", "eu-central-1",
+    "ap-east-1", "us-east-1",
 ]
 
 @st.cache_data(ttl=3600)
@@ -524,63 +535,83 @@ def get_all_regions():
     return sorted([r["RegionName"] for r in ec2.describe_regions()["Regions"]])
 
 def fetch_ec2_for_region(region):
+    """Fetch EC2 instances in one region. Returns (instances, error)."""
     instances = []
     try:
-        ec2 = boto3.client("ec2", region_name=region)
-        response = ec2.describe_instances()
-        for res in response.get("Reservations", []):
-            for inst in res.get("Instances", []):
-                name = next((tag["Value"] for tag in inst.get("Tags", []) if tag["Key"] == "Name"), "-")
+        # Fresh session per call: boto3's default session is not thread-safe
+        ec2 = boto3.session.Session().client("ec2", region_name=region)
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for res in page.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
+                    name = tags.get("Name", "-")
+                    project = tags.get("Project") or tags.get("project")
 
-                # Determine pricing model
-                lifecycle = inst.get("InstanceLifecycle", "")
-                if lifecycle == "spot":
-                    pricing = "Spot"
-                elif lifecycle == "scheduled":
-                    pricing = "Scheduled"
-                else:
-                    pricing = "On-Demand"
+                    # Determine pricing model
+                    lifecycle = inst.get("InstanceLifecycle", "")
+                    if lifecycle == "spot":
+                        pricing = "Spot"
+                    elif lifecycle == "scheduled":
+                        pricing = "Scheduled"
+                    else:
+                        pricing = "On-Demand"
 
-                instances.append({
-                    "Name": name,
-                    "Instance ID": inst["InstanceId"],
-                    "Type": inst.get("InstanceType", "-"),
-                    "Pricing": pricing,
-                    "State": inst["State"]["Name"],
-                    "Region": region,
-                    "Private IP": inst.get("PrivateIpAddress", "-"),
-                    "Public IP": inst.get("PublicIpAddress", "-"),
-                })
-    except:
-        pass
-    return instances
+                    instances.append({
+                        "Name": name,
+                        "Instance ID": inst["InstanceId"],
+                        "Type": inst.get("InstanceType", "-"),
+                        "Pricing": pricing,
+                        "State": inst["State"]["Name"],
+                        "Billing Center": get_center_label(classify_resource(region, project)),
+                        "Region": region,
+                        "Private IP": inst.get("PrivateIpAddress", "-"),
+                        "Public IP": inst.get("PublicIpAddress", "-"),
+                    })
+    except (ClientError, BotoCoreError) as e:
+        return instances, str(e)
+    return instances, None
 
 def fetch_rds_for_region(region):
+    """Fetch RDS instances in one region. Returns (instances, error)."""
     instances = []
     try:
-        rds = boto3.client("rds", region_name=region)
-        response = rds.describe_db_instances()
-        for db in response.get("DBInstances", []):
-            instances.append({
-                "Identifier": db["DBInstanceIdentifier"],
-                "Engine": db.get("Engine", "-"),
-                "Version": db.get("EngineVersion", "-"),
-                "Status": db.get("DBInstanceStatus", "-"),
-                "Class": db.get("DBInstanceClass", "-"),
-                "Storage": f"{db.get('AllocatedStorage', 0)} GB",
-                "Region": region,
-            })
-    except:
-        pass
-    return instances
+        rds = boto3.session.Session().client("rds", region_name=region)
+        paginator = rds.get_paginator("describe_db_instances")
+        for page in paginator.paginate():
+            for db in page.get("DBInstances", []):
+                instances.append({
+                    "Identifier": db["DBInstanceIdentifier"],
+                    "Engine": db.get("Engine", "-"),
+                    "Version": db.get("EngineVersion", "-"),
+                    "Status": db.get("DBInstanceStatus", "-"),
+                    "Class": db.get("DBInstanceClass", "-"),
+                    "Storage": f"{db.get('AllocatedStorage', 0)} GB",
+                    "Billing Center": get_center_label(classify_resource(region, None)),
+                    "Region": region,
+                    "Endpoint": db.get("Endpoint", {}).get("Address", ""),
+                    "Port": db.get("Endpoint", {}).get("Port", ""),
+                })
+    except (ClientError, BotoCoreError) as e:
+        return instances, str(e)
+    return instances, None
 
 def fetch_all_parallel(fetch_func, regions):
-    all_data = []
+    """Run a per-region fetch in parallel; collect items and per-region errors."""
+    items, errors = [], {}
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(fetch_func, r): r for r in regions}
         for future in as_completed(futures):
-            all_data.extend(future.result())
-    return all_data
+            region = futures[future]
+            data, error = future.result()
+            items.extend(data)
+            if error:
+                errors[region] = error
+    return {
+        "items": items,
+        "errors": errors,
+        "fetched_at": datetime.now(timezone.utc),
+    }
 
 @st.cache_data(ttl=300)
 def get_ec2_data(regions_key):
@@ -590,21 +621,37 @@ def get_ec2_data(regions_key):
 def get_rds_data(regions_key):
     return fetch_all_parallel(fetch_rds_for_region, list(regions_key))
 
+@st.cache_data(ttl=900)
+def get_rds_restart_countdowns(rds_key):
+    """Cached auto-restart countdowns for stopped RDS instances.
+
+    Args:
+        rds_key: Tuple of (identifier, region, status) tuples (hashable cache key)
+    """
+    instances = [
+        {"Identifier": db_id, "Region": region, "Status": status}
+        for (db_id, region, status) in rds_key
+    ]
+    return get_restart_countdowns(instances)
+
 @st.cache_data(ttl=300)
 def get_billing_data():
     """Fetch billing data from Cost Explorer."""
     try:
         ce = boto3.client("ce", region_name="us-east-1")
 
-        # Get current month dates
-        today = datetime.utcnow().date()
+        # Get current month dates. End is exclusive, so use tomorrow: this
+        # includes today's partial spend and avoids Start == End on the 1st
+        # of the month (which Cost Explorer rejects).
+        today = datetime.now(timezone.utc).date()
         first_of_month = today.replace(day=1)
+        mtd_end = today + timedelta(days=1)
 
         # MTD Cost
         mtd_response = ce.get_cost_and_usage(
             TimePeriod={
                 "Start": first_of_month.strftime("%Y-%m-%d"),
-                "End": today.strftime("%Y-%m-%d"),
+                "End": mtd_end.strftime("%Y-%m-%d"),
             },
             Granularity="MONTHLY",
             Metrics=["UnblendedCost"],
@@ -626,18 +673,28 @@ def get_billing_data():
         last_month_cost = float(last_month_response["ResultsByTime"][0]["Total"]["UnblendedCost"]["Amount"]) if last_month_response["ResultsByTime"] else 0
 
         # Forecast
-        try:
-            forecast_response = ce.get_cost_forecast(
-                TimePeriod={
-                    "Start": today.strftime("%Y-%m-%d"),
-                    "End": (today.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d"),
-                },
-                Metric="UNBLENDED_COST",
-                Granularity="MONTHLY",
-            )
-            forecast = float(forecast_response["Total"]["Amount"])
-        except:
-            forecast = mtd_cost * 1.1  # Estimate if forecast fails
+        forecast_estimated = False
+        if mtd_end.month != today.month:
+            # Last day of the month: MTD already covers the whole month and
+            # a forecast call would have Start == End (ValidationException)
+            forecast = mtd_cost
+        else:
+            try:
+                forecast_response = ce.get_cost_forecast(
+                    TimePeriod={
+                        "Start": mtd_end.strftime("%Y-%m-%d"),
+                        "End": (today.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d"),
+                    },
+                    Metric="UNBLENDED_COST",
+                    Granularity="MONTHLY",
+                )
+                # Forecast covers the remaining days only — add MTD for month total
+                forecast = mtd_cost + float(forecast_response["Total"]["Amount"])
+            except (ClientError, BotoCoreError, KeyError, ValueError):
+                # Linear extrapolation when the forecast API has no data/permission
+                days_in_month = calendar.monthrange(today.year, today.month)[1]
+                forecast = (mtd_cost / today.day) * days_in_month if today.day > 0 else mtd_cost
+                forecast_estimated = True
 
         # Cost by service (top 5)
         service_response = ce.get_cost_and_usage(
@@ -741,6 +798,7 @@ def get_billing_data():
             "mtd_cost": mtd_cost,
             "last_month_cost": last_month_cost,
             "forecast": forecast,
+            "forecast_estimated": forecast_estimated,
             "top_services": services[:5],
             "regions_cost": regions_cost,
             "rds_costs": rds_costs[:10],
@@ -753,6 +811,7 @@ def get_billing_data():
             "mtd_cost": 0,
             "last_month_cost": 0,
             "forecast": 0,
+            "forecast_estimated": True,
             "top_services": [],
             "regions_cost": [],
             "rds_costs": [],
@@ -775,6 +834,10 @@ with st.sidebar:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Logout first: it must render before the Operate toggle so it can
+    # safely disarm ops controls on logout
+    auth.render_logout()
 
     st.markdown("---")
 
@@ -808,18 +871,21 @@ with st.sidebar:
 
     st.markdown("---")
 
-    if st.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+    st.markdown("##### Server Control")
+    ops_armed = control_view.render_mode_toggle()
 
     st.markdown("---")
 
-    st.markdown(f"""
-    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: #5c5c6e;">
-        Last updated<br/>
-        <span style="color: #8b8b9e;">{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span>
-    </div>
-    """, unsafe_allow_html=True)
+    if st.button("🔄 Refresh inventory", width="stretch",
+                 help="Re-fetch EC2/RDS state. Billing cache is kept (Cost Explorer charges per call)."):
+        get_ec2_data.clear()
+        get_rds_data.clear()
+        st.rerun()
+
+    if st.button("💵 Refresh billing", width="stretch",
+                 help="Re-query Cost Explorer (~$0.07 in API charges; data lags up to 24h)."):
+        get_billing_data.clear()
+        st.rerun()
 
 # Main content
 st.markdown("""
@@ -835,13 +901,42 @@ if not selected_regions:
     st.warning("Please select at least one region to monitor.")
     st.stop()
 
+# Operate-mode banner
+if ops_armed:
+    control_view.render_armed_banner()
+
+# Live transition tracker for in-flight start/stop/reboot actions
+control_view.render_pending_ops(get_ec2_data.clear, get_rds_data.clear)
+
 # Load data
 cache_key = tuple(sorted(selected_regions))
 
 with st.spinner(""):
-    ec2_data = get_ec2_data(cache_key)
-    rds_data = get_rds_data(cache_key)
+    ec2_payload = get_ec2_data(cache_key)
+    rds_payload = get_rds_data(cache_key)
     billing = get_billing_data()
+
+ec2_data = ec2_payload["items"]
+rds_data = rds_payload["items"]
+
+# Surface per-region fetch failures — a silent failure would make resources
+# vanish, which on an ops dashboard reads as "terminated"
+fetch_errors = {**ec2_payload["errors"], **rds_payload["errors"]}
+if fetch_errors:
+    failed = ", ".join(f"`{r}`" for r in sorted(fetch_errors))
+    with st.container():
+        st.warning(f"⚠️ Fetch failed for some regions — resources there may be missing or incomplete: {failed}")
+        with st.expander("Error details"):
+            for r, err in sorted(fetch_errors.items()):
+                st.code(f"{r}: {err}", language="text")
+
+# Data freshness (cached up to 5 min — show actual fetch time, not render time)
+data_age_s = int((datetime.now(timezone.utc) - ec2_payload["fetched_at"]).total_seconds())
+st.markdown(f"""
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: #5c5c6e; margin-bottom: 0.75rem;">
+    Inventory fetched {data_age_s}s ago · {ec2_payload["fetched_at"].strftime("%H:%M:%S")} UTC
+</div>
+""", unsafe_allow_html=True)
 
 # Metrics row
 col1, col2, col3, col4 = st.columns(4)
@@ -879,14 +974,16 @@ with col3:
     """, unsafe_allow_html=True)
 
 with col4:
-    stopped = len([i for i in ec2_data if i["State"] == "stopped"])
-    alert_color = "negative" if stopped > 0 else "positive"
+    stopped_ec2 = len([i for i in ec2_data if i["State"] == "stopped"])
+    rds_attention = len([i for i in rds_data if i["Status"] != "available"])
+    attention = stopped_ec2 + rds_attention
+    alert_color = "negative" if attention > 0 else "positive"
     st.markdown(f"""
     <div class="metric-card">
         <div class="icon-badge red">⚠️</div>
-        <div class="label">Alerts</div>
-        <div class="value">{stopped}</div>
-        <div class="delta {alert_color}">● {stopped} stopped instances</div>
+        <div class="label">Needs Attention</div>
+        <div class="value">{attention}</div>
+        <div class="delta {alert_color}">● {stopped_ec2} EC2 stopped · {rds_attention} RDS offline</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -901,8 +998,14 @@ if billing["available"]:
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
-        change = billing["mtd_cost"] - (billing["last_month_cost"] * (datetime.now().day / 30))
-        change_pct = (change / billing["last_month_cost"] * 100) if billing["last_month_cost"] > 0 else 0
+        # Compare MTD against last month's spend prorated to the same day
+        # count, using the actual length of last month (not a flat 30)
+        today_utc = datetime.now(timezone.utc).date()
+        last_month_anchor = today_utc.replace(day=1) - timedelta(days=1)
+        days_in_last_month = calendar.monthrange(last_month_anchor.year, last_month_anchor.month)[1]
+        pace = billing["last_month_cost"] * (today_utc.day / days_in_last_month)
+        change = billing["mtd_cost"] - pace
+        change_pct = (change / pace * 100) if pace > 0 else 0
         change_class = "negative" if change > 0 else "positive"
 
         st.markdown(f"""
@@ -916,11 +1019,12 @@ if billing["available"]:
         """, unsafe_allow_html=True)
 
     with col2:
+        forecast_note = "● end of month (est.)" if billing.get("forecast_estimated") else "● end of month"
         st.markdown(f"""
         <div class="metric-card">
             <div class="label">Forecast</div>
             <div class="value" style="font-size: 1.5rem;">${billing["forecast"]:,.0f}</div>
-            <div class="delta neutral">● end of month</div>
+            <div class="delta neutral">{forecast_note}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -990,28 +1094,50 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if ec2_data:
-    df_ec2 = pd.DataFrame(ec2_data)
+    # Deterministic order: rows come back in region-completion order, which
+    # varies per fetch — a persisted positional selection must stay stable
+    df_ec2 = pd.DataFrame(ec2_data).sort_values(
+        ["Region", "Name", "Instance ID"]).reset_index(drop=True)
+    df_ec2["StateRaw"] = df_ec2["State"]
+    state_emoji = {"running": "🟢", "stopped": "🔴", "terminated": "⚫"}
+    df_ec2["State"] = df_ec2["StateRaw"].map(lambda s: f"{state_emoji.get(s, '🟡')} {s}")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         region_filter = st.multiselect("Filter by Region", sorted(df_ec2["Region"].unique()), key="ec2_region", placeholder="All regions")
     with col2:
-        state_filter = st.multiselect("Filter by State", sorted(df_ec2["State"].unique()), key="ec2_state", placeholder="All states")
+        state_filter = st.multiselect("Filter by State", sorted(df_ec2["StateRaw"].unique()), key="ec2_state", placeholder="All states")
+    with col3:
+        bc_filter = st.multiselect("Filter by Billing Center", sorted(df_ec2["Billing Center"].unique()), key="ec2_bc", placeholder="All centers")
 
     if region_filter:
         df_ec2 = df_ec2[df_ec2["Region"].isin(region_filter)]
     if state_filter:
-        df_ec2 = df_ec2[df_ec2["State"].isin(state_filter)]
+        df_ec2 = df_ec2[df_ec2["StateRaw"].isin(state_filter)]
+    if bc_filter:
+        df_ec2 = df_ec2[df_ec2["Billing Center"].isin(bc_filter)]
 
-    st.dataframe(
+    ec2_event = st.dataframe(
         df_ec2,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="ec2_table",
         column_config={
             "State": st.column_config.TextColumn("State", help="Instance state"),
             "Instance ID": st.column_config.TextColumn("Instance ID", width="medium"),
+            "StateRaw": None,  # hidden — used by the action bar
         }
     )
+
+    # Server control: action bar for the selected row (bounds-checked —
+    # a persisted selection can outlive a shrinking filter result)
+    selected_rows = ec2_event.selection.rows
+    if selected_rows and selected_rows[0] < len(df_ec2):
+        control_view.render_ec2_action_bar(df_ec2.iloc[selected_rows[0]].to_dict(), ops_armed)
+    else:
+        st.caption("Select a row to start / stop / reboot / connect.")
 else:
     st.info("No EC2 instances found in the selected regions.")
 
@@ -1024,7 +1150,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if rds_data:
-    df_rds = pd.DataFrame(rds_data)
+    df_rds = pd.DataFrame(rds_data).sort_values(
+        ["Region", "Identifier"]).reset_index(drop=True)
+    df_rds["StatusRaw"] = df_rds["Status"]
+    status_emoji = {"available": "🟢", "stopped": "🔴"}
+    df_rds["Status"] = df_rds["StatusRaw"].map(lambda s: f"{status_emoji.get(s, '🟡')} {s}")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1037,11 +1167,59 @@ if rds_data:
     if engine_filter:
         df_rds = df_rds[df_rds["Engine"].isin(engine_filter)]
 
-    st.dataframe(
+    rds_event = st.dataframe(
         df_rds,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="rds_table",
+        column_config={
+            "StatusRaw": None,  # hidden — used by the action bar
+            "Endpoint": None,   # hidden — shown in the Connect popover
+            "Port": None,
+        },
     )
+
+    # Server control: action bar for the selected row (bounds-checked)
+    selected_rds = rds_event.selection.rows
+    if selected_rds and selected_rds[0] < len(df_rds):
+        control_view.render_rds_action_bar(df_rds.iloc[selected_rds[0]].to_dict(), ops_armed)
+    else:
+        st.caption("Select a row to start / stop / reboot or view the endpoint.")
+
+    # 7-day auto-restart watchdog: AWS silently restarts stopped RDS
+    # instances after 7 days and they resume billing
+    countdowns = get_rds_restart_countdowns(tuple(
+        (i["Identifier"], i["Region"], i["Status"]) for i in rds_data
+    ))
+    # Recompute remaining at render time — the cached value can be 15 min stale
+    now_utc = datetime.now(timezone.utc)
+    for c in countdowns:
+        c["remaining"] = (c["restart_eta"] - now_utc) if c["restart_eta"] else None
+    if countdowns:
+        urgent = [c for c in countdowns if c["remaining"] is not None and c["remaining"].total_seconds() < 48 * 3600]
+        if urgent:
+            names = ", ".join(f"**{c['db_id']}**" for c in urgent)
+            st.error(f"⏰ {names}: AWS will auto-restart within 48h — compute billing resumes unless stopped again.", icon="🚨")
+        chips = []
+        for c in countdowns:
+            secs = c["remaining"].total_seconds() if c["remaining"] is not None else None
+            color = "#ff4757" if secs is not None and secs < 48 * 3600 else "#ffb347"
+            eta_txt = c["restart_eta"].strftime("%b %d %H:%M UTC") if c["restart_eta"] else "unknown"
+            chips.append(
+                f'<div style="display: inline-flex; align-items: center; gap: 8px; background: {color}1f; '
+                f'border: 1px solid {color}66; border-radius: 20px; padding: 4px 14px; margin: 0 8px 8px 0; '
+                f'font-family: \'JetBrains Mono\', monospace; font-size: 0.72rem; color: {color};">'
+                f'⏰ {html.escape(c["db_id"])} auto-restarts in {format_remaining(c["remaining"])} · {eta_txt}</div>'
+            )
+        st.markdown(
+            '<div style="margin-top: 0.25rem;">'
+            '<span style="font-family: \'JetBrains Mono\', monospace; font-size: 0.65rem; color: #5c5c6e; '
+            'text-transform: uppercase; letter-spacing: 0.1em;">Stopped RDS — AWS auto-restart watchdog</span><br/>'
+            + "".join(chips) + "</div>",
+            unsafe_allow_html=True,
+        )
 else:
     st.info("No RDS instances found in the selected regions.")
 
@@ -1136,7 +1314,7 @@ if billing["available"] and billing.get("rds_costs"):
                 bargap=0.3,
             )
 
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, width="stretch", config={'displayModeBar': False})
 
             # Show average daily cost
             avg_daily = sum(d["cost"] for d in billing["rds_daily"]) / len(billing["rds_daily"]) if billing["rds_daily"] else 0
@@ -1146,6 +1324,14 @@ if billing["available"] and billing.get("rds_costs"):
                 <div style="font-family: 'Outfit', sans-serif; font-weight: 600; color: #4da3ff; font-size: 1.1rem;">${avg_daily:,.2f}</div>
             </div>
             """, unsafe_allow_html=True)
+
+# Audit trail of control actions taken from this dashboard
+st.markdown("""
+<div class="section-header">
+    <h2>🧾 Audit</h2>
+</div>
+""", unsafe_allow_html=True)
+control_view.render_audit_log()
 
 # Footer
 st.markdown("""

@@ -25,7 +25,10 @@ def get_client(service: str, region: str = "us-east-1"):
     Returns:
         boto3 client for the specified service
     """
-    return boto3.client(service, region_name=region, config=RETRY_CONFIG)
+    # A fresh Session per client: boto3's default session is not thread-safe,
+    # and these clients are created from ThreadPoolExecutor workers.
+    session = boto3.session.Session()
+    return session.client(service, region_name=region, config=RETRY_CONFIG)
 
 
 def get_available_regions() -> list[str]:

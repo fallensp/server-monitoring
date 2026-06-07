@@ -46,3 +46,9 @@ Thumbs.db
 
 # AWS credentials (should use AWS CLI config instead)
 credentials.json
+
+# Dashboard control-action audit trail (local operational log)
+action_audit.jsonl
+
+# RDS stop-time registry for the auto-restart watchdog
+.rds_stop_registry.json

@@ -14,6 +14,7 @@ from src.services.rds_health import (
     get_status_dim_color,
     get_status_icon,
     get_max_connections_for_class,
+    get_memory_for_class,
 )
 
 
@@ -31,8 +32,11 @@ def fetch_health_for_instance(db_id: str, region: str, instance_class: str) -> d
     """
     metrics = get_latest_rds_health(db_id, region)
     max_conn = get_max_connections_for_class(instance_class)
+    total_memory = get_memory_for_class(instance_class)
 
-    overall = get_overall_health(metrics, max_connections=max_conn)
+    overall = get_overall_health(
+        metrics, max_connections=max_conn, total_memory_bytes=total_memory
+    )
 
     return {
         "db_id": db_id,
@@ -41,6 +45,7 @@ def fetch_health_for_instance(db_id: str, region: str, instance_class: str) -> d
         "metrics": metrics,
         "overall_status": overall,
         "max_connections": max_conn,
+        "total_memory_bytes": total_memory,
     }
 
 
@@ -72,16 +77,19 @@ def fetch_all_health(rds_instances: tuple) -> list[dict]:
             try:
                 health = future.result()
                 health["engine"] = inst.get("Engine", "")
+                health["db_status"] = inst.get("Status", "")
                 results.append(health)
             except Exception:
                 results.append({
                     "db_id": inst["Identifier"],
                     "region": inst["Region"],
                     "engine": inst.get("Engine", ""),
+                    "db_status": inst.get("Status", ""),
                     "instance_class": inst.get("Class", ""),
                     "metrics": {},
                     "overall_status": HealthStatus.UNKNOWN,
                     "max_connections": None,
+                    "total_memory_bytes": None,
                 })
 
     return results
@@ -111,9 +119,13 @@ def render_summary_cards(health_data: list[dict]):
     healthy = sum(1 for h in health_data if h["overall_status"] == HealthStatus.HEALTHY)
     warning = sum(1 for h in health_data if h["overall_status"] == HealthStatus.WARNING)
     critical = sum(1 for h in health_data if h["overall_status"] == HealthStatus.CRITICAL)
+    offline = sum(
+        1 for h in health_data
+        if h.get("db_status") == "stopped" or h["overall_status"] == HealthStatus.UNKNOWN
+    )
     total = len(health_data)
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col_offline, col4 = st.columns(5)
 
     with col1:
         st.markdown(f"""
@@ -139,6 +151,15 @@ def render_summary_cards(health_data: list[dict]):
             <div class="health-summary-icon">{get_status_icon(HealthStatus.CRITICAL)}</div>
             <div class="health-summary-label">Critical</div>
             <div class="health-summary-value">{critical}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_offline:
+        st.markdown(f"""
+        <div class="health-summary-card" style="border-color: rgba(108, 117, 125, 0.4);">
+            <div class="health-summary-icon" style="color: #6c757d;">&#9209;</div>
+            <div class="health-summary-label">Offline</div>
+            <div class="health-summary-value">{offline}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -183,11 +204,13 @@ def get_triggered_alerts(health: dict) -> list[dict]:
     alerts = []
     metrics = health.get("metrics", {})
     max_conn = health.get("max_connections")
+    total_memory = health.get("total_memory_bytes")
 
     for metric_name, value in metrics.items():
         status = calculate_metric_status(
             metric_name,
             value,
+            total_memory_bytes=total_memory,
             max_connections=max_conn,
         )
         if status in (HealthStatus.WARNING, HealthStatus.CRITICAL):
@@ -241,8 +264,11 @@ def render_health_card(health: dict, index: int):
     engine = health.get("engine", "") or ""
     db_id = health.get("db_id", "") or ""
 
+    # Stopped databases are offline, not "unknown" — label them explicitly
+    status_label = "STOPPED" if health.get("db_status") == "stopped" else status.value.upper()
+
     # Build HTML as single string to avoid rendering issues
-    html = f'''<div class="health-card" style="border-left: 4px solid {status_color};"><div class="health-card-header"><div class="health-card-title"><span class="health-card-icon" style="background: {status_dim}; color: {status_color};">&#9632;</span><span class="health-card-name">{db_id}</span></div><div class="health-card-meta">{engine} | {region_short}</div></div><div class="health-status-badge" style="background: {status_dim}; color: {status_color};">{status.value.upper()}</div>{alert_html}<div class="health-metrics-row"><div class="health-metric"><div class="health-metric-label">CPU</div><div class="health-metric-value">{cpu}</div></div><div class="health-metric"><div class="health-metric-label">Memory</div><div class="health-metric-value">{memory}</div></div><div class="health-metric"><div class="health-metric-label">Conn</div><div class="health-metric-value">{connections}</div></div></div></div>'''
+    html = f'''<div class="health-card" style="border-left: 4px solid {status_color};"><div class="health-card-header"><div class="health-card-title"><span class="health-card-icon" style="background: {status_dim}; color: {status_color};">&#9632;</span><span class="health-card-name">{db_id}</span></div><div class="health-card-meta">{engine} | {region_short}</div></div><div class="health-status-badge" style="background: {status_dim}; color: {status_color};">{status_label}</div>{alert_html}<div class="health-metrics-row"><div class="health-metric"><div class="health-metric-label">CPU</div><div class="health-metric-value">{cpu}</div></div><div class="health-metric"><div class="health-metric-label">Memory</div><div class="health-metric-value">{memory}</div></div><div class="health-metric"><div class="health-metric-label">Conn</div><div class="health-metric-value">{connections}</div></div></div></div>'''
 
     st.markdown(html, unsafe_allow_html=True)
 
@@ -324,7 +350,7 @@ def render_health_charts(db_id: str, region: str):
                 ),
             )
 
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=f"chart_{db_id}_{metric_name}")
+            st.plotly_chart(fig, width="stretch", config={'displayModeBar': False}, key=f"chart_{region}_{db_id}_{metric_name}")
 
 
 def render_rds_health_section(rds_data: list[dict]):

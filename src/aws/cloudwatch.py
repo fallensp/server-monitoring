@@ -1,6 +1,6 @@
 """CloudWatch metrics fetching."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from src.aws.client import get_client
 
 
@@ -20,7 +20,7 @@ def get_ec2_metrics(
         Dict with CPUUtilization, NetworkIn, NetworkOut metrics
     """
     cw = get_client("cloudwatch", region)
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours)
 
     metrics = {}
@@ -70,7 +70,7 @@ def get_rds_metrics(
         Dict with CPUUtilization, DatabaseConnections, FreeStorageSpace metrics
     """
     cw = get_client("cloudwatch", region)
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours)
 
     metrics = {}
@@ -116,7 +116,7 @@ def get_latest_cpu_utilization(instance_id: str, region: str, namespace: str) ->
         Latest CPU percentage or None if unavailable
     """
     cw = get_client("cloudwatch", region)
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=10)
 
     dimension_name = "InstanceId" if namespace == "AWS/EC2" else "DBInstanceIdentifier"
@@ -169,7 +169,7 @@ def get_rds_health_metrics(
         WriteLatency, DiskQueueDepth, DatabaseConnections
     """
     cw = get_client("cloudwatch", region)
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours)
 
     # Use 1-minute resolution for health monitoring
@@ -216,7 +216,7 @@ def get_latest_rds_health(db_instance_id: str, region: str) -> dict[str, float |
         Dict with latest values for each health metric, None if unavailable
     """
     cw = get_client("cloudwatch", region)
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=10)
 
     latest_metrics = {}
