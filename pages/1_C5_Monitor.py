@@ -23,7 +23,8 @@ from src.services import c5_monitor
 st.markdown(f"<style>{get_base_css()}</style>", unsafe_allow_html=True)
 
 # Login gate — nothing below runs (or is fetched) until authenticated
-auth.require_login()
+# with a role that may open this page
+auth.require_login(page="c5")
 
 TIME_RANGES = {
     "1 hour": 1,
@@ -51,7 +52,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    nav.render_nav()
+    nav.render_nav(auth.allowed_pages())
 
     st.markdown("---")
 

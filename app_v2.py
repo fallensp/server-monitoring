@@ -34,7 +34,8 @@ st.set_page_config(
 st.markdown(f"<style>{get_base_css()}</style>", unsafe_allow_html=True)
 
 # Login gate — nothing below runs (or is fetched) until authenticated
-auth.require_login()
+# with a role that may open this page
+auth.require_login(page="overview")
 
 # Region configurations — the actual infrastructure footprint (all four
 # billing centers): Singapore, Jakarta, Tokyo, Hong Kong + us-east-1 (global)
@@ -355,7 +356,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    nav.render_nav()
+    nav.render_nav(auth.allowed_pages())
 
     st.markdown("---")
 
