@@ -7,3 +7,8 @@ font = "sans serif"
 
 [server]
 headless = true
+
+[client]
+# Hide the auto-generated page nav (it labels the home page "app v2");
+# both pages render their own st.page_link entries instead
+showSidebarNavigation = false

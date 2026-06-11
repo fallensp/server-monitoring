@@ -242,3 +242,86 @@ def get_latest_rds_health(db_instance_id: str, region: str) -> dict[str, float |
             latest_metrics[metric_name] = None
 
     return latest_metrics
+
+
+def get_metric_data_bundle(
+    region: str,
+    queries: list[dict],
+    hours: int = 24,
+) -> dict[str, list[dict]]:
+    """Fetch many CloudWatch metrics in a single GetMetricData call.
+
+    Much cheaper than one GetMetricStatistics call per metric, and the
+    queries may mix namespaces (AWS/EC2 + AWS/EBS + AWS/RDS).
+
+    Args:
+        region: AWS region name
+        queries: List of query dicts with keys:
+            key: result-dict key for this series
+            namespace: e.g. "AWS/EC2"
+            metric_name: e.g. "CPUUtilization"
+            dimensions: e.g. [{"Name": "InstanceId", "Value": "i-..."}]
+            stat: "Average" | "Maximum" | "Sum" (default "Average")
+            period: datapoint period in seconds (default 300)
+            per_second: if True, divide each value by the period —
+                converts a Sum series (e.g. NetworkIn bytes) into a rate
+        hours: lookback window
+
+    Returns:
+        Dict mapping each query's key to a sorted list of
+        {"timestamp", "value"} datapoints (empty list for metrics that
+        simply have no datapoints, e.g. a stopped instance).
+
+    Raises:
+        botocore exceptions on API failure. Deliberately NOT swallowed:
+        GetMetricData is all-or-nothing, so a swallowed error would make
+        every series look empty — on a monitoring page that renders as
+        "everything healthy", which is the opposite of the truth.
+    """
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours)
+
+    metric_queries = []
+    id_to_query = {}
+    for i, q in enumerate(queries):
+        qid = f"m{i}"
+        id_to_query[qid] = q
+        metric_queries.append({
+            "Id": qid,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": q["namespace"],
+                    "MetricName": q["metric_name"],
+                    "Dimensions": q["dimensions"],
+                },
+                "Period": int(q.get("period", 300)),
+                "Stat": q.get("stat", "Average"),
+            },
+            "ReturnData": True,
+        })
+
+    results = {q["key"]: [] for q in queries}
+    cw = get_client("cloudwatch", region)
+    paginator = cw.get_paginator("get_metric_data")
+    # GetMetricData accepts at most 500 queries per call
+    for batch_start in range(0, len(metric_queries), 500):
+        batch = metric_queries[batch_start:batch_start + 500]
+        for page in paginator.paginate(
+            MetricDataQueries=batch,
+            StartTime=start_time,
+            EndTime=end_time,
+            ScanBy="TimestampAscending",
+        ):
+            for r in page.get("MetricDataResults", []):
+                q = id_to_query.get(r["Id"])
+                if q is None:
+                    continue
+                divisor = float(q.get("period", 300)) if q.get("per_second") else 1.0
+                results[q["key"]].extend(
+                    {"timestamp": t, "value": v / divisor}
+                    for t, v in zip(r.get("Timestamps", []), r.get("Values", []))
+                )
+
+    for series in results.values():
+        series.sort(key=lambda d: d["timestamp"])
+    return results
